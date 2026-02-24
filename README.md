@@ -13,11 +13,26 @@
 ./gradlew test
 ```
 
-#### PostgreSQL + Docker Compose 테스트
+#### Docker 컨테이너 기반 E2E 테스트
 ```bash
 ./gradlew cucumberTest
 ```
-Docker Compose로 PostgreSQL 17 컨테이너를 자동 실행한 뒤 Cucumber 테스트를 수행하고, 완료 후 컨테이너를 자동 정리합니다.
+Docker 이미지를 빌드하고, Docker Compose로 앱(28080 포트) + PostgreSQL 17 컨테이너를 실행한 뒤 Cucumber 테스트를 수행합니다. 완료 후 컨테이너를 자동 정리합니다.
+
+#### Docker 수동 관리
+```bash
+# Docker 이미지 빌드
+./gradlew dockerBuild
+
+# 컨테이너 시작 (앱 + PostgreSQL)
+./gradlew dockerUp
+
+# 앱 응답 확인
+curl http://localhost:28080
+
+# 컨테이너 정리
+./gradlew dockerDown
+```
 
 ### 테스트 구조
 ```
