@@ -4,13 +4,20 @@
 
 ### 요구 사항
 - Java 21
+- Docker & Docker Compose (PostgreSQL 테스트 시)
 
 ### 테스트 실행
+
+#### 기본 테스트 (H2 인메모리 DB)
 ```bash
 ./gradlew test
 ```
 
-실행하면 Cucumber BDD 시나리오가 Spring Boot 통합 테스트로 실행됩니다.
+#### PostgreSQL + Docker Compose 테스트
+```bash
+./gradlew cucumberTest
+```
+Docker Compose로 PostgreSQL 17 컨테이너를 자동 실행한 뒤 Cucumber 테스트를 수행하고, 완료 후 컨테이너를 자동 정리합니다.
 
 ### 테스트 구조
 ```
@@ -36,6 +43,7 @@ src/test/
 | 테스트 | JUnit Platform Suite + RestAssured |
 | 통합 | cucumber-spring + SpringBootTest (RANDOM_PORT) |
 | 데이터 격리 | DatabaseCleaner (TRUNCATE) + H2 인메모리 DB |
+| 인프라 | Docker Compose (PostgreSQL 17) |
 
 ---
 
