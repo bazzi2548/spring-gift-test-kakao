@@ -1,5 +1,44 @@
 # spring-gift-test
 
+## 실행 방법
+
+### 요구 사항
+- Java 21
+
+### 테스트 실행
+```bash
+./gradlew test
+```
+
+실행하면 Cucumber BDD 시나리오가 Spring Boot 통합 테스트로 실행됩니다.
+
+### 테스트 구조
+```
+src/test/
+├── java/gift/
+│   ├── CucumberTest.java                  # Cucumber 실행 진입점 (JUnit Platform Suite)
+│   ├── CucumberSpringConfiguration.java   # Spring Boot 통합 + 시나리오 격리 설정
+│   ├── DatabaseCleaner.java               # 매 시나리오 전 DB TRUNCATE
+│   └── steps/
+│       ├── ScenarioContext.java            # 시나리오 간 공유 상태 (@ScenarioScope)
+│       ├── CommonStepDefinitions.java      # 카테고리 등록, 응답 코드 검증
+│       ├── ProductStepDefinitions.java     # 상품 등록/조회 Step Definitions
+│       └── GiftStepDefinitions.java        # 선물하기 Step Definitions
+└── resources/features/
+    ├── product.feature                     # 상품 관리 시나리오 (Gherkin)
+    └── gift.feature                        # 선물하기 시나리오 (Gherkin)
+```
+
+### 주요 기술 스택
+| 구분 | 기술 |
+| :--- | :--- |
+| BDD | Cucumber 7 + Gherkin (한글) |
+| 테스트 | JUnit Platform Suite + RestAssured |
+| 통합 | cucumber-spring + SpringBootTest (RANDOM_PORT) |
+| 데이터 격리 | DatabaseCleaner (TRUNCATE) + H2 인메모리 DB |
+
+---
+
 ## 1. 비즈니스 맥락 및 검증 범위
 본 프로젝트는 '카카오톡 선물하기'의 핵심 도메인인 제품 관리와 선물 발송 로직을 검증한다. 현재 시스템은 **옵션 재고 차감 기반**으로 동작하며, 인증은 **HTTP Header(Member-Id)**를 통해 수행되는 구조를 따른다.
 
