@@ -35,26 +35,48 @@ tasks.named('test') {
 	useJUnitPlatform()
 }
 
+tasks.register('dockerBuild') {
+	description = 'Builds the Docker image for the application'
+	group = 'docker'
+	doLast {
+		exec {
+			commandLine 'docker', 'build', '-t', 'gift-app', '.'
+		}
+	}
+}
+
+tasks.register('dockerUp') {
+	description = 'Starts Docker Compose services'
+	group = 'docker'
+	doLast {
+		exec {
+			commandLine 'docker', 'compose', 'up', '-d', '--wait'
+		}
+	}
+}
+
+tasks.register('dockerDown') {
+	description = 'Stops and removes Docker Compose containers'
+	group = 'docker'
+	doLast {
+		exec {
+			commandLine 'docker', 'compose', 'down'
+		}
+	}
+}
+
 tasks.register('cucumberTest', Test) {
-	description = 'Runs Cucumber tests against PostgreSQL via Docker Compose'
+	description = 'Runs Cucumber tests against Dockerized app and PostgreSQL'
 	group = 'verification'
 	useJUnitPlatform()
 	systemProperty 'spring.profiles.active', 'test'
+	systemProperty 'test.port', '28080'
+	dependsOn 'dockerBuild'
 
 	doFirst {
 		exec {
 			commandLine 'docker', 'compose', 'up', '-d', '--wait'
 		}
 	}
-	finalizedBy 'dockerComposeDown'
-}
-
-tasks.register('dockerComposeDown') {
-	description = 'Stops and removes Docker Compose containers'
-	group = 'verification'
-	doLast {
-		exec {
-			commandLine 'docker', 'compose', 'down'
-		}
-	}
+	finalizedBy 'dockerDown'
 }
