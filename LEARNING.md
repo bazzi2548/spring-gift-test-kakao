@@ -152,17 +152,52 @@ Docker 이미지를 빌드할 때 **여러 단계(stage)** 를 나누어 진행�
 멀티 단계: JRE + JAR = ~200MB
 ```
 
+### Builder Stage와 Runtime Stage의 역할
+
+Multi-stage build는 보통 두 단계로 나뉜다. 각 단계는 **서로 다른 베이스 이미지**를 사용하며, 역할이 명확히 분리된다.
+
+#### Builder Stage (빌드 단계)
+- **역할**: 소스 코드를 컴파일하고 실행 가능한 아티팩트(JAR)를 생성한다.
+- **베이스 이미지**: 컴파일에 필요한 도구가 포함된 이미지 (예: `gradle:8-jdk21` — Gradle + JDK)
+- **포함 항목**: 소스 코드, 빌드 도구, 컴파일러, 의존성, 빌드 캐시
+- **최종 이미지에 포함 여부**: **X** — 빌드가 끝나면 이 단계의 파일시스템은 버려진다.
+
+#### Runtime Stage (실행 단계)
+- **역할**: Builder Stage에서 생성된 아티팩트만 복사하여 애플리케이션을 실행한다.
+- **베이스 이미지**: 실행에 필요한 최소한의 이미지 (예: `eclipse-temurin:21-jre` — JRE만 포함)
+- **포함 항목**: JRE + JAR 파일 + 런타임에 필요한 도구(curl 등)
+- **최종 이미지에 포함 여부**: **O** — 이것이 최종 Docker 이미지가 된다.
+
+```
+Builder Stage                     Runtime Stage
+┌──────────────────┐             ┌──────────────────┐
+│ gradle:8-jdk21   │             │ temurin:21-jre   │
+│                  │             │                  │
+│ 소스 코드         │             │ app.jar (복사됨) │
+│ Gradle           │  ── JAR ──▶ │                  │
+│ JDK (컴파일러)    │   만 전달   │ 최종 이미지      │
+│ 빌드 캐시         │             │ (~200MB)         │
+│ (~800MB)         │             │                  │
+└──────────────────┘             └──────────────────┘
+      버려짐                          배포됨
+```
+
+핵심은 Builder Stage의 **산출물(JAR)만** Runtime Stage로 가져오고, 빌드에만 필요했던 도구들은 최종 이미지에 포함되지 않는다는 것이다.
+
 ### 이번 프로젝트의 Dockerfile 분석
 
 ```dockerfile
-# ─── 1단계: 빌드 ───
+# ─── 1단계: 빌드 (Builder Stage) ───
 FROM gradle:8-jdk21 AS build    # Gradle + JDK 21이 포함된 이미지
 WORKDIR /app
 COPY . .                         # 소스 코드 전체 복사
 RUN gradle bootJar --no-daemon   # JAR 파일 생성 → build/libs/*.jar
 
-# ─── 2단계: 실행 ───
+# ─── 2단계: 실행 (Runtime Stage) ───
 FROM eclipse-temurin:21-jre      # JRE만 포함된 경량 이미지
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+#   ^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#   패키지 목록 갱신    curl 설치 (healthcheck용)                       캐시 삭제 (이미지 크기 절약)
 WORKDIR /app
 COPY --from=build /app/build/libs/*.jar app.jar   # 1단계에서 JAR만 가져옴
 ENTRYPOINT ["java", "-jar", "app.jar"]
@@ -247,6 +282,62 @@ build      # 로컬 빌드 산출물 (컨테이너 내부에서 새로 빌드하
 ---
 
 ## 3. Docker Compose 서비스 간 네트워킹
+
+### `services`란 무엇인가
+
+`docker-compose.yml`의 최상위 키 `services`는 실행할 **컨테이너 그룹**을 정의한다. 각 서비스는 하나의 컨테이너(또는 여러 복제본)에 대응한다.
+
+```yaml
+services:          # 최상위 키 — 컨테이너 정의 시작
+  postgres:        # 서비스 이름 = 컨테이너 이름의 기반 = Docker 네트워크 내 호스트명
+    image: postgres:17
+    ...
+
+  app:             # 두 번째 서비스
+    image: gift-app
+    ...
+```
+
+- **서비스 이름**(`postgres`, `app`)은 Docker Compose가 자동 생성하는 네트워크에서 **호스트명**으로 사용된다.
+- 각 서비스는 독립적인 컨테이너로 실행되지만, 같은 네트워크에 속하므로 서비스 이름으로 서로 통신할 수 있다.
+- `docker compose up`은 `services` 아래 정의된 **모든 서비스**를 시작한다. 특정 서비스만 시작하려면 `docker compose up postgres`처럼 이름을 지정한다.
+
+### `volumes`란 무엇인가
+
+Docker 컨테이너는 기본적으로 **임시 파일시스템**을 가진다. 컨테이너가 삭제되면 내부의 모든 데이터도 함께 사라진다. `volumes`는 데이터를 컨테이너 외부에 **영속적으로 저장**하는 메커니즘이다.
+
+```yaml
+services:
+  postgres:
+    image: postgres:17
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # Named Volume — 데이터 영속화
+
+volumes:          # 최상위 키 — Named Volume 선언
+  pgdata:         # Volume 이름
+```
+
+| 유형 | 문법 | 설명 |
+|:---|:---|:---|
+| **Named Volume** | `pgdata:/var/lib/...` | Docker가 관리하는 볼륨. 컨테이너 삭제 후에도 데이터 유지 |
+| **Bind Mount** | `./data:/var/lib/...` | 호스트의 특정 경로를 컨테이너에 마운트 |
+| **Anonymous Volume** | `/var/lib/...` | 이름 없는 볼륨. 컨테이너 삭제 시 참조 어려움 |
+
+#### 이 프로젝트에서 `volumes`를 사용하지 않는 이유
+
+```yaml
+# 현재 docker-compose.yml — volumes 없음
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: gift_test
+    # volumes 미설정 → 컨테이너 삭제 시 데이터 소멸
+```
+
+테스트 용도의 DB이므로 **데이터 영속성이 불필요**하다. `docker compose down`으로 컨테이너를 삭제하면 DB 데이터도 깔끔하게 사라지는 것이 오히려 바람직하다. 매 테스트 실행마다 깨끗한 상태에서 시작할 수 있기 때문이다.
+
+프로덕션 환경이라면 `volumes`를 반드시 설정하여 컨테이너 재시작/업데이트 시에도 데이터가 유지되도록 해야 한다.
 
 ### 기본 원리
 
@@ -349,6 +440,65 @@ depends_on:
 | 용도 | 개발 중 빠른 피드백 | CI/CD, 릴리스 전 검증 |
 
 H2 테스트는 로직의 정합성을 빠르게 확인하고, Docker 테스트는 실제 환경에서의 동작을 보장한다. 두 테스트가 **같은 테스트 코드**를 공유하되, 설정만 달라지는 구조가 핵심이다.
+
+### H2 단위 테스트와 PostgreSQL 통합 테스트를 분리하는 방법
+
+두 테스트 환경을 분리하기 위해 **3가지 메커니즘**이 협력한다.
+
+#### 1. Gradle 태스크 분리 — 진입점이 다르다
+
+```groovy
+// build.gradle
+
+// H2 테스트 — 기본 test 태스크 (별도 설정 불필요)
+// ./gradlew test → Spring 기본 설정(H2) 사용
+
+// PostgreSQL 테스트 — 별도 태스크 등록
+tasks.register('cucumberTest', Test) {
+    systemProperty 'spring.profiles.active', 'test'   // 프로파일 전환
+    systemProperty 'test.port', '28080'                // Docker 앱 포트
+    dependsOn 'dockerBuild'
+    finalizedBy 'dockerDown'
+}
+```
+
+- `./gradlew test`는 시스템 프로퍼티를 설정하지 않으므로 Spring 기본 설정(H2)이 사용된다.
+- `./gradlew cucumberTest`는 `test` 프로파일을 활성화하고 Docker 앱 포트를 지정한다.
+
+#### 2. Spring Profile — 설정 파일이 다르다
+
+```
+./gradlew test
+  → 프로파일 없음
+  → application.properties (H2 설정)
+
+./gradlew cucumberTest
+  → -Dspring.profiles.active=test
+  → application.properties + application-test.properties (PostgreSQL 설정)
+```
+
+#### 3. 포트 분기 — 요청 대상이 다르다
+
+```java
+RestAssured.port = testPort > 0 ? testPort : port;
+//                 cucumberTest    test(H2)
+```
+
+**이 3가지를 조합하면** 하나의 테스트 코드가 두 환경에서 동작한다.
+
+```
+┌────── ./gradlew test ──────┐    ┌──── ./gradlew cucumberTest ────┐
+│                             │    │                                │
+│  프로파일: 없음              │    │  프로파일: test                 │
+│  DB: H2 인메모리             │    │  DB: PostgreSQL (Docker)       │
+│  서버: 임베디드 (RANDOM_PORT)│    │  서버: Docker 앱 (28080)       │
+│  속도: 수 초                 │    │  속도: 수십 초                  │
+│                             │    │                                │
+│  용도: 개발 중 빠른 피드백    │    │  용도: CI/CD, 릴리스 전 검증   │
+└─────────────────────────────┘    └────────────────────────────────┘
+              │                                │
+              └──────── 같은 테스트 코드 ────────┘
+```
 
 ### 동일 코드, 다른 환경
 
@@ -457,6 +607,72 @@ spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
 ```
 
 프로파일 설정 파일의 값은 기본 `application.properties`보다 우선한다. 따라서 기본 설정이 H2를 사용하더라도, `test` 프로파일이 활성화되면 PostgreSQL로 전환된다.
+
+#### Spring Profile의 동작 원리
+
+Spring Profile은 **환경별로 다른 설정과 빈(Bean)을 선택적으로 활성화**하는 메커니즘이다.
+
+**1. 설정 파일 로딩 순서**
+
+프로파일이 `test`로 활성화되면 Spring Boot는 아래 순서로 설정 파일을 로드한다.
+
+```
+1. application.properties          ← 항상 로드 (기본 설정)
+2. application-test.properties     ← 'test' 프로파일 활성 시 추가 로드
+```
+
+같은 키가 양쪽에 있으면 **프로파일 설정이 기본 설정을 덮어쓴다**.
+
+이 프로젝트에서 `application.properties`에는 datasource URL이 없다. 이 경우 Spring Boot는 classpath에 H2가 있으면 **자동으로 H2 인메모리 DB를 구성**한다 (Spring Boot Auto-configuration). `test` 프로파일이 활성화되면 `application-test.properties`의 PostgreSQL URL이 이 자동 구성을 **덮어쓴다**.
+
+```properties
+# application.properties — datasource 미설정
+spring.application.name=gift
+# → Spring Boot가 classpath의 H2를 감지하여 자동으로 인메모리 DB 구성
+
+# application-test.properties — 명시적 PostgreSQL 설정
+spring.datasource.url=jdbc:postgresql://localhost:15432/gift_test
+# → 프로파일 활성 시 자동 구성 대신 이 설정이 사용됨
+```
+
+**2. 프로파일 활성화 방법**
+
+| 방법 | 예시 | 우선순위 |
+|:---|:---|:---|
+| 시스템 프로퍼티 | `-Dspring.profiles.active=test` | 높음 |
+| 환경변수 | `SPRING_PROFILES_ACTIVE=test` | 중간 |
+| `application.properties` | `spring.profiles.active=test` | 낮음 |
+| `@ActiveProfiles` (테스트) | `@ActiveProfiles("test")` | 테스트 전용 |
+
+**3. 프로파일별 빈 활성화**
+
+설정 파일뿐 아니라 특정 빈도 프로파일에 따라 활성화할 수 있다.
+
+```java
+@Configuration
+@Profile("test")           // 'test' 프로파일일 때만 이 설정 클래스가 활성화
+public class TestConfig {
+    @Bean
+    public DataSource dataSource() { ... }
+}
+
+@Profile("!test")          // 'test' 프로파일이 아닐 때만 활성화
+public class ProdConfig { ... }
+```
+
+**4. 이 프로젝트에서의 활용**
+
+```
+./gradlew test
+  → 프로파일 미설정 → application.properties만 로드 → H2 사용
+
+./gradlew cucumberTest
+  → -Dspring.profiles.active=test
+  → application.properties + application-test.properties 로드
+  → PostgreSQL 사용
+```
+
+같은 코드, 같은 엔티티, 같은 테스트가 **프로파일에 따라 다른 DB**에 연결된다.
 
 #### (3) Docker 환경변수 → Spring 설정 오버라이드
 
@@ -661,6 +877,103 @@ docker compose down
 - `down`: 컨테이너, 네트워크를 중지하고 삭제한다.
 - 볼륨은 기본적으로 유지된다. `-v` 옵션을 추가하면 볼륨도 삭제한다.
 
+### Gradle Task에서 Shell 스크립트를 실행하는 원리
+
+Gradle은 JVM 위에서 동작하는 빌드 도구이지만, `exec`를 통해 **외부 프로세스(Shell 명령)** 를 실행할 수 있다.
+
+#### 실행 방식 비교
+
+```groovy
+// 방법 1: exec + commandLine (권장) — 셸을 거치지 않음
+doLast {
+    exec {
+        commandLine 'docker', 'compose', 'up', '-d', '--wait'
+    }
+}
+
+// 방법 2: 셸을 통해 실행 — 파이프, 리다이렉션 등 셸 기능 사용 가능
+doLast {
+    exec {
+        commandLine 'bash', '-c', 'docker compose up -d --wait && echo "Done"'
+    }
+}
+```
+
+| 방식 | 장점 | 단점 |
+|:---|:---|:---|
+| `commandLine` 직접 실행 | 셸 해석 없어 안전, 인자에 공백/특수문자 문제 없음 | 파이프(`\|`), 리다이렉션(`>`) 사용 불가 |
+| `bash -c` 통해 실행 | 셸 기능(파이프, `&&`, `\|\|`) 사용 가능 | 셸 인젝션 위험, 이스케이프 필요 |
+
+#### `exec`의 동작 방식
+
+```groovy
+exec {
+    commandLine 'docker', 'build', '-t', 'gift-app', '.'
+    // 내부적으로 Java의 ProcessBuilder를 사용하여 OS 프로세스를 fork
+    // 프로세스가 exit code 0을 반환하면 성공, 아니면 빌드 실패
+}
+```
+
+- Gradle의 `exec`는 내부적으로 **Java의 `ProcessBuilder`** 를 사용한다.
+- `commandLine`의 각 요소는 `ProcessBuilder`의 인자 리스트로 전달된다.
+- 프로세스의 **exit code**가 0이 아니면 `ExecException`이 발생하여 빌드가 중단된다.
+- `exec`는 프로세스가 완료될 때까지 **블로킹**한다 — 비동기 실행이 아니다.
+
+### 테스트 실패 시에도 DB(컨테이너)를 정리하는 방법
+
+테스트가 실패하면 이후 태스크가 실행되지 않는 것이 Gradle의 기본 동작이다. 하지만 Docker 컨테이너는 **테스트 성공/실패와 무관하게 반드시 정리**해야 한다. 그렇지 않으면 포트 충돌이나 리소스 누수가 발생한다.
+
+#### `finalizedBy` — try-finally 패턴
+
+```groovy
+tasks.register('cucumberTest', Test) {
+    finalizedBy 'dockerDown'    // 성공하든 실패하든 반드시 dockerDown 실행
+}
+```
+
+```
+try {
+    cucumberTest()    // 테스트 실행
+} finally {
+    dockerDown()      // 항상 실행 — finalizedBy의 의미
+}
+```
+
+#### `dependsOn` vs `finalizedBy` 비교
+
+```
+테스트 성공 시:
+  dependsOn:    dockerBuild → cucumberTest    (선행 태스크 성공해야 실행)
+  finalizedBy:  cucumberTest → dockerDown     (후행 태스크 항상 실행)
+
+테스트 실패 시:
+  dependsOn:    dockerBuild → cucumberTest(실패) → 이후 태스크 중단
+  finalizedBy:  cucumberTest(실패) → dockerDown   (그래도 실행됨!)
+```
+
+#### 다른 정리 방법
+
+```groovy
+// 방법 1: finalizedBy (이 프로젝트에서 사용)
+finalizedBy 'dockerDown'
+
+// 방법 2: try-catch를 직접 구현
+doLast {
+    try {
+        // 테스트 로직
+    } finally {
+        exec { commandLine 'docker', 'compose', 'down' }
+    }
+}
+
+// 방법 3: Gradle의 buildFinished 훅 (비권장 — 전역 효과)
+gradle.buildFinished {
+    exec { commandLine 'docker', 'compose', 'down' }
+}
+```
+
+`finalizedBy`가 가장 깔끔한 방법이다. 태스크 간의 관계를 선언적으로 표현하며, Gradle이 실행 순서를 자동 관리한다.
+
 ---
 
 ## 7. E2E 테스트 아키텍처
@@ -702,9 +1015,46 @@ docker compose down
 - `DatabaseCleaner`가 Gradle JVM에서 TRUNCATE하면 → Docker App도 빈 DB를 보게 됨
 - Docker App이 데이터를 쓰면 → Gradle JVM의 테스트에서 API 조회로 확인 가능
 
-### 임베디드 Spring 컨텍스트의 역할
+### `webEnvironment` 옵션과 선택 이유
 
-`cucumberTest`에서 `@SpringBootTest(RANDOM_PORT)`로 임베디드 서버도 뜬다. 하지만 **HTTP 요청은 Docker 앱으로** 보낸다. 임베디드 컨텍스트가 필요한 이유는 `DatabaseCleaner`에서 사용하는 `EntityManager`를 Spring이 관리해야 하기 때문이다.
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+```
+
+`@SpringBootTest`의 `webEnvironment`는 테스트 시 웹 서버를 어떻게 구성할지 결정한다.
+
+| 옵션 | 동작 | 용도 |
+|:---|:---|:---|
+| `MOCK` (기본값) | 서버를 시작하지 않음. `MockMvc`로 가짜 요청 | 단위/슬라이스 테스트 |
+| `RANDOM_PORT` | 임베디드 서버를 랜덤 포트로 시작 | 실제 HTTP 통신 테스트 |
+| `DEFINED_PORT` | `application.properties`에 정의된 포트로 시작 | 포트 고정이 필요한 경우 |
+| `NONE` | 웹 환경 자체를 시작하지 않음 | 웹과 무관한 서비스 테스트 |
+
+#### 왜 `NONE`이 아니라 `RANDOM_PORT`인가
+
+Docker 앱으로 HTTP 요청을 보내는 구조라면 임베디드 서버가 불필요해 보인다. `NONE`을 쓰면 되지 않을까?
+
+```
+NONE을 사용할 경우:
+  Spring Context 시작 → 웹 서버 없음 → @LocalServerPort 주입 실패 → 에러
+```
+
+문제는 **같은 테스트 코드**가 두 환경에서 동작해야 한다는 것이다.
+
+```
+./gradlew test          → 임베디드 서버 필요 (RestAssured가 직접 요청)
+./gradlew cucumberTest  → 임베디드 서버 불필요 (Docker 앱으로 요청)
+```
+
+`RANDOM_PORT`를 유지하면 두 환경 모두에서 코드 변경 없이 동작한다. `cucumberTest`에서 임베디드 서버가 뜨지만 실제로 사용되지 않을 뿐이다 — `test.port`가 설정되면 RestAssured는 Docker 앱(28080)으로 요청한다.
+
+#### `NONE`을 사용할 수 있는 조건
+
+만약 `cucumberTest` 전용 설정 클래스를 분리한다면 `NONE`을 사용할 수 있다. 하지만 이 프로젝트에서는 코드 중복을 피하기 위해 **하나의 설정 클래스를 공유**하는 전략을 택했다.
+
+### 임베디드 Spring 컨텍스트의 역할 — 왜 EntityManager가 필요한가
+
+`cucumberTest`에서 `@SpringBootTest(RANDOM_PORT)`로 임베디드 서버도 뜬다. 하지만 **HTTP 요청은 Docker 앱으로** 보낸다. 그럼에도 임베디드 Spring 컨텍스트가 필요한 이유는 **DB 정리(cleanup)** 때문이다.
 
 ```java
 @Autowired
@@ -716,6 +1066,48 @@ public void setUp() {
     databaseCleaner.clear();        // DB 정리는 임베디드 컨텍스트의 EntityManager로
 }
 ```
+
+#### 왜 HTTP API가 아니라 EntityManager로 DB를 정리하는가
+
+시나리오마다 DB를 TRUNCATE해야 테스트 격리가 보장된다. 이를 구현하는 방법은 두 가지이다.
+
+| 방법 | 구현 | 장단점 |
+|:---|:---|:---|
+| **HTTP API** | Docker 앱에 `DELETE /api/test/reset` 같은 엔드포인트 추가 | 프로덕션 코드에 테스트 전용 API가 섞임 |
+| **EntityManager 직접 접근** | 테스트 프로세스가 같은 DB에 연결하여 TRUNCATE 실행 | 프로덕션 코드 오염 없음, Spring 컨텍스트 필요 |
+
+이 프로젝트는 두 번째 방법을 사용한다. `DatabaseCleaner`가 `EntityManager`를 통해 네이티브 SQL(`TRUNCATE TABLE ...`)을 실행하려면 Spring이 `EntityManager`를 생성하고 관리해야 한다. 이것이 임베디드 Spring 컨텍스트가 필요한 이유이다.
+
+```
+┌── Gradle JVM ──────────────────────────────┐
+│                                             │
+│  Spring Context                             │
+│  ├─ EntityManager ──── localhost:15432 ───┐ │
+│  │  (TRUNCATE 실행)                       │ │
+│  └─ RestAssured ──── localhost:28080 ──┐  │ │
+│     (HTTP 요청)                        │  │ │
+└────────────────────────────────────────┼──┼─┘
+                                         │  │
+                              Docker App │  │ PostgreSQL
+                              (비즈니스) │  │ (공유 DB)
+                                         ▼  ▼
+```
+
+#### JdbcTemplate vs EntityManager
+
+DB 정리에는 `JdbcTemplate`을 사용할 수도 있다.
+
+```java
+// JdbcTemplate 방식 — 테이블 이름을 수동 관리
+jdbcTemplate.execute("TRUNCATE TABLE product, category, gift RESTART IDENTITY CASCADE");
+
+// EntityManager 방식 — JPA 메타모델에서 테이블 이름 자동 수집
+entityManager.getMetamodel().getEntities()  // 등록된 모든 엔티티 → 테이블 이름
+```
+
+이 프로젝트에서 `EntityManager`를 선택한 이유:
+- **테이블 자동 수집**: JPA 메타모델에서 `@Entity`가 붙은 클래스의 테이블 이름을 자동으로 가져온다. 엔티티가 추가/삭제되어도 코드를 수정할 필요 없다.
+- **JdbcTemplate의 단점**: TRUNCATE할 테이블 이름을 문자열로 하드코딩해야 한다. 엔티티가 추가될 때마다 목록을 수동 업데이트해야 하므로 누락 위험이 있다.
 
 ---
 
