@@ -22,6 +22,7 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	runtimeOnly 'com.h2database:h2'
+	runtimeOnly 'org.postgresql:postgresql'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
 	testImplementation 'io.rest-assured:rest-assured'
 	testImplementation 'io.cucumber:cucumber-java:7.22.0'
@@ -32,4 +33,28 @@ dependencies {
 
 tasks.named('test') {
 	useJUnitPlatform()
+}
+
+tasks.register('cucumberTest', Test) {
+	description = 'Runs Cucumber tests against PostgreSQL via Docker Compose'
+	group = 'verification'
+	useJUnitPlatform()
+	systemProperty 'spring.profiles.active', 'test'
+
+	doFirst {
+		exec {
+			commandLine 'docker', 'compose', 'up', '-d', '--wait'
+		}
+	}
+	finalizedBy 'dockerComposeDown'
+}
+
+tasks.register('dockerComposeDown') {
+	description = 'Stops and removes Docker Compose containers'
+	group = 'verification'
+	doLast {
+		exec {
+			commandLine 'docker', 'compose', 'down'
+		}
+	}
 }
