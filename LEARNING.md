@@ -1232,3 +1232,271 @@ docker compose up -d --wait
       ▼
   cucumberTest 본체 실행 (안전하게 HTTP 요청 가능)
 ```
+
+---
+
+## 부록 A. 점진적인 테스트 환경 구축
+
+테스트 환경은 한 번에 완성하는 것이 아니라, 프로젝트의 성숙도에 따라 **단계적으로 확장**하는 것이 현실적이다. 각 단계는 이전 단계의 한계를 보완하며, 단계마다 별도의 인프라 구성이 수반된다.
+
+### 3단계 구성
+
+```
+Smoke Test → Integration Test → E2E Test
+(앱이 뜨는가)   (연결이 되는가)     (시나리오가 동작하는가)
+```
+
+#### 1단계: Smoke Test — "앱이 정상 기동되는가"
+
+배포 직후 또는 CI 파이프라인 초반에 실행하는 **최소한의 검증**이다. 앱이 기동되고 핵심 의존성(DB, 외부 서비스)에 연결 가능한 상태인지만 확인한다.
+
+**검증 대상**
+- 애플리케이션 컨텍스트가 정상 로딩되는가
+- Health 엔드포인트(`/actuator/health`)가 200을 반환하는가
+- 필수 빈(Bean)이 등록되어 있는가
+
+**환경 구성**
+- Health 엔드포인트 노출 설정 (Spring Boot Actuator)
+- CI 파이프라인에서 앱 기동 후 curl/httpie로 health 체크
+
+**특징**
+- 실행 시간: 수 초
+- 실패 시 의미: "이 빌드는 배포할 수 없다"
+- 비즈니스 로직은 검증하지 않는다
+
+**예시: 컨텍스트 로딩 테스트**
+
+```java
+@SpringBootTest
+class SmokeTest {
+
+    @Autowired
+    private ApplicationContext context;
+
+    @Test
+    void contextLoads() {
+        // 스프링 컨텍스트가 정상적으로 로드되는지 확인
+        // 빈 등록 실패, 설정 오류 등이 있으면 여기서 실패한다
+        assertThat(context).isNotNull();
+    }
+
+    @Test
+    void essentialBeansAreRegistered() {
+        // 핵심 빈이 존재하는지 확인
+        assertThat(context.getBean(ProductService.class)).isNotNull();
+        assertThat(context.getBean(GiftService.class)).isNotNull();
+    }
+}
+```
+
+**예시: Health 엔드포인트 테스트**
+
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class HealthCheckSmokeTest {
+
+    @LocalServerPort
+    int port;
+
+    @Test
+    void healthEndpointReturns200() {
+        given()
+            .port(port)
+        .when()
+            .get("/actuator/health")
+        .then()
+            .statusCode(200)
+            .body("status", equalTo("UP"));
+    }
+}
+```
+
+#### 2단계: Integration Test — "컴포넌트 간 연결이 정상인가"
+
+개별 컴포넌트가 아니라, **컴포넌트 간의 경계**가 올바르게 동작하는지 검증한다. DB 쿼리가 의도대로 실행되는지, 외부 API 호출이 정상인지 등을 확인한다.
+
+**검증 대상**
+- Repository ↔ DB: 쿼리가 올바른 결과를 반환하는가
+- Service ↔ 외부 API: 요청/응답 매핑이 정확한가
+- 메시지 큐 발행/소비가 동작하는가
+
+**환경 구성**
+- 테스트용 DB 구성 (H2, Testcontainers 등)
+- 외부 서비스 모킹 (WireMock, MockServer 등)
+- Spring의 슬라이스 테스트 (`@DataJpaTest`, `@WebMvcTest` 등)
+
+**특징**
+- 실행 시간: 수 초 ~ 수십 초
+- 실패 시 의미: "특정 컴포넌트 간의 연결에 문제가 있다"
+- 문제 지점을 비교적 좁은 범위에서 특정할 수 있다
+
+**예시: Repository ↔ DB 통합 테스트**
+
+```java
+@DataJpaTest  // JPA 관련 빈만 로딩 (전체 컨텍스트보다 가볍다)
+class ProductRepositoryTest {
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    @Autowired
+    private CategoryRepository categoryRepository;
+
+    @Test
+    void 카테고리별_상품_조회() {
+        Category category = categoryRepository.save(new Category("음료"));
+        productRepository.save(new Product("아메리카노", 500, "/img", category));
+        productRepository.save(new Product("라떼", 1000, "/img", category));
+
+        List<Product> products = productRepository.findByCategoryId(category.getId());
+
+        assertThat(products).hasSize(2);
+        assertThat(products).extracting("name")
+            .containsExactlyInAnyOrder("아메리카노", "라떼");
+    }
+}
+```
+
+**예시: Service ↔ 외부 API 통합 테스트 (WireMock)**
+
+```java
+@SpringBootTest
+@WireMockTest(httpPort = 8089)
+class KakaoApiServiceTest {
+
+    @Autowired
+    private KakaoApiService kakaoApiService;
+
+    @Test
+    void 카카오_메시지_전송_성공() {
+        // 외부 API를 모킹하여 실제 호출 없이 통합 동작 검증
+        stubFor(post("/v2/api/talk/memo/default/send")
+            .willReturn(ok()));
+
+        MessageResult result = kakaoApiService.sendMessage("token", "hello");
+
+        assertThat(result.isSuccess()).isTrue();
+    }
+
+    @Test
+    void 카카오_API_장애_시_예외_처리() {
+        stubFor(post("/v2/api/talk/memo/default/send")
+            .willReturn(serverError()));
+
+        assertThatThrownBy(() -> kakaoApiService.sendMessage("token", "hello"))
+            .isInstanceOf(KakaoApiException.class);
+    }
+}
+```
+
+#### 3단계: E2E Test — "사용자 시나리오가 동작하는가"
+
+실제 사용자의 행동을 시뮬레이션하여, **시스템 전체가 기대대로 동작하는지** 검증한다. 모든 컴포넌트가 조립된 상태에서 API 호출 또는 UI 조작을 통해 전체 흐름을 확인한다.
+
+**검증 대상**
+- 사용자 시나리오의 전체 흐름 (예: 회원가입 → 로그인 → 상품 조회 → 주문)
+- 여러 서비스가 협력하는 비즈니스 프로세스
+- 실제 인프라(DB, 메시지 큐, 캐시) 위에서의 동작
+
+**환경 구성**
+- Docker Compose로 전체 인프라 구성 (DB, 앱, 외부 서비스)
+- 테스트 데이터 관리 전략 (시나리오 간 격리)
+- 테스트 시나리오 프레임워크 (Cucumber, REST Assured 등)
+
+**특징**
+- 실행 시간: 수십 초 ~ 수 분
+- 실패 시 의미: "사용자 관점에서 기능이 깨졌다"
+- 실패 원인을 특정하기 어렵다 (어느 계층 문제인지 파악 필요)
+
+**예시: Cucumber 시나리오 (BDD)**
+
+```gherkin
+Feature: 선물하기
+  Scenario: 나에게 선물하면 해당 옵션의 재고가 감소한다
+    Given "음료" 카테고리가 등록되어 있다
+    And "아메리카노" 상품이 500원으로 등록되어 있다
+    And "ICE" 옵션이 수량 10으로 등록되어 있다
+    When "보내는사람"이 "보내는사람"에게 "ICE" 옵션을 1개 선물한다
+    Then 응답 상태 코드는 200이다
+    And "ICE" 옵션의 남은 수량은 9이다
+```
+
+**예시: REST Assured로 전체 흐름 테스트**
+
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class GiftE2ETest {
+
+    @LocalServerPort
+    int port;
+
+    @Test
+    void 선물_발송_전체_흐름() {
+        // 1. 카테고리 등록
+        long categoryId = given().port(port)
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "음료"))
+        .when()
+            .post("/api/categories")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getLong("id");
+
+        // 2. 상품 등록
+        long productId = given().port(port)
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "아메리카노", "price", 500,
+                         "imageUrl", "/img", "categoryId", categoryId))
+        .when()
+            .post("/api/products")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getLong("id");
+
+        // 3. 옵션 등록
+        given().port(port)
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "ICE", "quantity", 10))
+        .when()
+            .post("/api/products/" + productId + "/options")
+        .then()
+            .statusCode(200);
+
+        // 4. 선물 발송
+        given().port(port)
+            .contentType(ContentType.JSON)
+            .body(Map.of("optionName", "ICE", "quantity", 1,
+                         "message", "선물!"))
+        .when()
+            .post("/api/gifts")
+        .then()
+            .statusCode(200);
+
+        // 5. 재고 확인
+        given().port(port)
+        .when()
+            .get("/api/products/" + productId + "/options")
+        .then()
+            .statusCode(200)
+            .body("[0].quantity", equalTo(9));
+    }
+}
+```
+
+### 왜 이 순서인가
+
+```
+Smoke        Integration        E2E
+  │               │              │
+ 빠르다 ◀──────────────────────▶ 느리다
+ 얕다   ◀──────────────────────▶ 깊다
+ 싸다   ◀──────────────────────▶ 비싸다 (인프라)
+```
+
+- **Smoke부터**: 앱이 뜨지 않으면 다른 테스트는 의미 없다. 가장 빠르고 가장 먼저 실패해야 한다.
+- **Integration 다음**: 개별 연결이 깨진 상태에서 E2E를 돌리면 실패 원인 파악이 어렵다.
+- **E2E 마지막**: 모든 연결이 정상인 상태에서 전체 흐름을 검증해야 의미 있는 결과를 얻는다.
+
+### Unit Test를 별도 단계로 두지 않는 이유
+
+Unit Test는 개별 함수나 클래스의 로직을 검증하는 것으로, **별도의 환경 구성이 필요 없다**. JUnit만 있으면 바로 작성할 수 있다. "테스트 환경 구축"이라는 맥락에서는 인프라 셋업이 수반되는 Smoke → Integration → E2E가 점진적 확장의 대상이다. Unit Test는 환경 구축과 무관하게 **항상 작성해야 하는 기본 습관**이다.
